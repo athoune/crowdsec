@@ -70,6 +70,7 @@ require (
 	github.com/beevik/etree v1.1.0
 	github.com/blackfireio/osinfo v1.0.3
 	github.com/google/winops v0.0.0-20211216095627-f0e86eb1453b
+	github.com/gorilla/websocket v1.5.0
 	github.com/ivanpirog/coloredcobra v1.0.1
 	github.com/mattn/go-isatty v0.0.14
 	github.com/pbnjay/memory v0.0.0-20210728143218-7b4eea64cf58
