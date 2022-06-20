@@ -6,6 +6,11 @@ import (
 	"os"
 	"strings"
 
+	"github.com/pkg/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	log "github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v2"
+
 	"github.com/crowdsecurity/crowdsec/pkg/acquisition/configuration"
 	cloudwatchacquisition "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/cloudwatch"
 	dockeracquisition "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/docker"
@@ -13,14 +18,11 @@ import (
 	journalctlacquisition "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/journalctl"
 	kafkaacquisition "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/kafka"
 	kinesisacquisition "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/kinesis"
+	lokiacquisition "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/loki"
 	syslogacquisition "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/syslog"
 	wineventlogacquisition "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/wineventlog"
 	"github.com/crowdsecurity/crowdsec/pkg/csconfig"
 	"github.com/crowdsecurity/crowdsec/pkg/types"
-	"github.com/pkg/errors"
-	"github.com/prometheus/client_golang/prometheus"
-	log "github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v2"
 
 	tomb "gopkg.in/tomb.v2"
 )
@@ -75,6 +77,10 @@ var AcquisitionSources = []struct {
 		name:  "kafka",
 		iface: func() DataSource { return &kafkaacquisition.KafkaSource{} },
 	},
+	{
+		name:  "loki",
+		iface: func() DataSource { return &lokiacquisition.LokiSource{} },
+	},
 }
 
 func GetDataSourceIface(dataSourceType string) DataSource {
@@ -88,8 +94,8 @@ func GetDataSourceIface(dataSourceType string) DataSource {
 
 func DataSourceConfigure(commonConfig configuration.DataSourceCommonCfg) (*DataSource, error) {
 
-	//we dump it back to []byte, because we want to decode the yaml blob twice :
-	//once to DataSourceCommonCfg, and then later to the dedicated type of the datasource
+	// we dump it back to []byte, because we want to decode the yaml blob twice :
+	// once to DataSourceCommonCfg, and then later to the dedicated type of the datasource
 	yamlConfig, err := yaml.Marshal(commonConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "unable to marshal back interface")
@@ -124,7 +130,7 @@ func DataSourceConfigure(commonConfig configuration.DataSourceCommonCfg) (*DataS
 	return nil, fmt.Errorf("cannot find source %s", commonConfig.Source)
 }
 
-//detectBackwardCompatAcquis : try to magically detect the type for backward compat (type was not mandatory then)
+// detectBackwardCompatAcquis : try to magically detect the type for backward compat (type was not mandatory then)
 func detectBackwardCompatAcquis(sub configuration.DataSourceCommonCfg) string {
 
 	if _, ok := sub.Config["filename"]; ok {
@@ -191,11 +197,11 @@ func LoadAcquisitionFromFile(config *csconfig.CrowdsecServiceCfg) ([]DataSource,
 				break
 			}
 
-			//for backward compat ('type' was not mandatory, detect it)
+			// for backward compat ('type' was not mandatory, detect it)
 			if guessType := detectBackwardCompatAcquis(sub); guessType != "" {
 				sub.Source = guessType
 			}
-			//it's an empty item, skip it
+			// it's an empty item, skip it
 			if len(sub.Labels) == 0 {
 				if sub.Source == "" {
 					log.Debugf("skipping empty item in %s", acquisFile)
@@ -234,7 +240,7 @@ func GetMetrics(sources []DataSource, aggregated bool) error {
 				if _, ok := err.(prometheus.AlreadyRegisteredError); !ok {
 					return errors.Wrapf(err, "could not register metrics for datasource %s", sources[i].GetName())
 				}
-				//ignore the error
+				// ignore the error
 			}
 		}
 
@@ -244,7 +250,7 @@ func GetMetrics(sources []DataSource, aggregated bool) error {
 
 func StartAcquisition(sources []DataSource, output chan types.Event, AcquisTomb *tomb.Tomb) error {
 	for i := 0; i < len(sources); i++ {
-		subsrc := sources[i] //ensure its a copy
+		subsrc := sources[i] // ensure its a copy
 		log.Debugf("starting one source %d/%d ->> %T", i, len(sources), subsrc)
 
 		AcquisTomb.Go(func() error {
@@ -256,7 +262,7 @@ func StartAcquisition(sources []DataSource, output chan types.Event, AcquisTomb 
 				err = subsrc.OneShotAcquisition(output, AcquisTomb)
 			}
 			if err != nil {
-				//if one of the acqusition returns an error, we kill the others to properly shutdown
+				// if one of the acqusition returns an error, we kill the others to properly shutdown
 				AcquisTomb.Kill(err)
 			}
 			return nil
