@@ -14,14 +14,15 @@ import (
 
 	leaky "github.com/crowdsecurity/crowdsec/pkg/leakybucket"
 
-	"github.com/crowdsecurity/crowdsec/pkg/acquisition/configuration"
-	lokiclient "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/loki/internal/lokiclient"
-	"github.com/crowdsecurity/crowdsec/pkg/types"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 	tomb "gopkg.in/tomb.v2"
 	"gopkg.in/yaml.v2"
+
+	"github.com/crowdsecurity/crowdsec/pkg/acquisition/configuration"
+	lokiclient "github.com/crowdsecurity/crowdsec/pkg/acquisition/modules/loki/internal/lokiclient"
+	"github.com/crowdsecurity/crowdsec/pkg/types"
 )
 
 const (
@@ -216,13 +217,13 @@ func (l *LokiSource) OneShotAcquisition(out chan types.Event, t *tomb.Tomb) erro
 	l.logger.Debug("Loki one shot acquisition")
 	readyCtx, cancel := context.WithTimeout(context.Background(), l.Config.WaitForReady)
 	defer cancel()
-	err := l.client.Ready(readyCtx)
+	err := l.client.Ready(readyCtx, t)
 	if err != nil {
 		return errors.Wrap(err, "loki is not ready")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	c := l.client.QueryRange(ctx)
+	c := l.client.QueryRange(ctx, t)
 
 	for {
 		select {
@@ -266,7 +267,7 @@ func (l *LokiSource) readOneEntry(entry lokiclient.Entry, labels map[string]stri
 func (l *LokiSource) StreamingAcquisition(out chan types.Event, t *tomb.Tomb) error {
 	readyCtx, cancel := context.WithTimeout(context.Background(), l.Config.WaitForReady)
 	defer cancel()
-	err := l.client.Ready(readyCtx)
+	err := l.client.Ready(readyCtx, t)
 	if err != nil {
 		return errors.Wrap(err, "loki is not ready")
 	}
@@ -274,24 +275,38 @@ func (l *LokiSource) StreamingAcquisition(out chan types.Event, t *tomb.Tomb) er
 	t.Go(func() error {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		respChan, err := l.client.Tail(ctx)
-		if err != nil {
-			ll.Errorf("could not start loki tail: %s", err)
-			return errors.Wrap(err, "could not start loki tail")
-		}
+	tail:
 		for {
-			select {
-			case resp := <-respChan:
-				if len(resp.DroppedEntries) > 0 {
-					ll.Warnf("%d entries dropped from loki response", len(resp.DroppedEntries))
-				}
-				for _, stream := range resp.Streams {
-					for _, entry := range stream.Entries {
-						l.readOneEntry(entry, l.Config.Labels, out)
-					}
-				}
-			case <-t.Dying():
+			if !t.Alive() {
 				return nil
+			}
+			tt := &tomb.Tomb{}
+			respChan, err := l.client.Tail(ctx, tt)
+			if err != nil {
+				ll.Errorf("could not start loki tail: %s", err)
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			for {
+				select {
+				case resp, ok := <-respChan:
+					if !ok {
+						ll.Warnf("Loki tail done, chan closed")
+						tt.Kill(fmt.Errorf("loki tail done"))
+						continue tail
+					}
+					if len(resp.DroppedEntries) > 0 {
+						ll.Warnf("%d entries dropped from loki response", len(resp.DroppedEntries))
+					}
+					for _, stream := range resp.Streams {
+						for _, entry := range stream.Entries {
+							l.readOneEntry(entry, l.Config.Labels, out)
+						}
+					}
+				case <-t.Dying():
+					tt.Kill(t.Err())
+					return nil
+				}
 			}
 		}
 	})
@@ -306,7 +321,7 @@ func (l *LokiSource) Dump() interface{} {
 	return l
 }
 
-//SupportedModes returns the supported modes by the acquisition module
+// SupportedModes returns the supported modes by the acquisition module
 func (l *LokiSource) SupportedModes() []string {
 	return []string{configuration.TAIL_MODE, configuration.CAT_MODE}
 }

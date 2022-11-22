@@ -12,18 +12,18 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/crowdsecurity/crowdsec/pkg/cwversion"
 	"github.com/gorilla/websocket"
 	"github.com/pkg/errors"
 	log "github.com/sirupsen/logrus"
 	"gopkg.in/tomb.v2"
+
+	"github.com/crowdsecurity/crowdsec/pkg/cwversion"
 )
 
 type LokiClient struct {
 	Logger *log.Entry
 
 	config Config
-	t      *tomb.Tomb
 }
 
 type Config struct {
@@ -42,16 +42,16 @@ type Config struct {
 	Limit int
 }
 
-func (lc *LokiClient) tailLogs(conn *websocket.Conn, c chan *LokiResponse, ctx context.Context) error {
+func (lc *LokiClient) tailLogs(ctx context.Context, conn *websocket.Conn, c chan *LokiResponse, t *tomb.Tomb) error {
 	tick := time.NewTicker(100 * time.Millisecond)
 
 	for {
 		select {
-		case <-lc.t.Dying():
+		case <-t.Dying():
 			lc.Logger.Info("LokiClient tomb is dying, closing connection")
 			tick.Stop()
 			return conn.Close()
-		case <-ctx.Done(): //this is technically useless, as the read from the websocket is blocking :(
+		case <-ctx.Done(): // this is technically useless, as the read from the websocket is blocking :(
 			lc.Logger.Info("LokiClient context is done, closing connection")
 			tick.Stop()
 			return conn.Close()
@@ -60,6 +60,7 @@ func (lc *LokiClient) tailLogs(conn *websocket.Conn, c chan *LokiResponse, ctx c
 			jsonResponse := &LokiResponse{}
 			err := conn.ReadJSON(jsonResponse)
 			if err != nil {
+				lc.Logger.Errorf("Error reading from WS: %s", err)
 				close(c)
 				return err
 			}
@@ -70,13 +71,13 @@ func (lc *LokiClient) tailLogs(conn *websocket.Conn, c chan *LokiResponse, ctx c
 	}
 }
 
-func (lc *LokiClient) queryRange(uri string, ctx context.Context, c chan *LokiQueryRangeResponse) error {
+func (lc *LokiClient) queryRange(ctx context.Context, uri string, c chan *LokiQueryRangeResponse, t *tomb.Tomb) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-lc.t.Dying():
-			return lc.t.Err()
+		case <-t.Dying():
+			return t.Err()
 		default:
 			lc.Logger.Debugf("Querying Loki: %s", uri)
 			resp, err := http.Get(uri)
@@ -104,11 +105,11 @@ func (lc *LokiClient) queryRange(uri string, ctx context.Context, c chan *LokiQu
 				close(c)
 				return nil
 			}
-			//Can we assume we will always have only one stream?
+			// Can we assume we will always have only one stream?
 			lastTs := lq.Data.Result[0].Entries[len(lq.Data.Result[0].Entries)-1].Timestamp
 
 			lc.Logger.Infof("Got %d results, last timestamp: %s (converted: %d)", len(lq.Data.Result[0].Entries), lastTs, strconv.Itoa(lastTs.Nanosecond()))
-			u, err := url.Parse(uri) //we can ignore the error, we know it's valid
+			u, err := url.Parse(uri) // we can ignore the error, we know it's valid
 			if err != nil {
 				return errors.Wrapf(err, "error parsing URL")
 			}
@@ -144,7 +145,7 @@ func (lc *LokiClient) getURLFor(endpoint string, params map[string]string) strin
 	return u.String()
 }
 
-func (lc *LokiClient) Ready(ctx context.Context) error {
+func (lc *LokiClient) Ready(ctx context.Context, t *tomb.Tomb) error {
 	tick := time.NewTicker(500 * time.Millisecond)
 	url := lc.getURLFor("ready", nil)
 	for {
@@ -152,9 +153,9 @@ func (lc *LokiClient) Ready(ctx context.Context) error {
 		case <-ctx.Done():
 			tick.Stop()
 			return ctx.Err()
-		case <-lc.t.Dying():
+		case <-t.Dying():
 			tick.Stop()
-			return lc.t.Err()
+			return t.Err()
 		case <-tick.C:
 			lc.Logger.Debug("Checking if Loki is ready")
 			resp, err := http.Get(url)
@@ -173,9 +174,9 @@ func (lc *LokiClient) Ready(ctx context.Context) error {
 	}
 }
 
-func (lc *LokiClient) Tail(ctx context.Context) (chan *LokiResponse, error) {
+func (lc *LokiClient) Tail(ctx context.Context, t *tomb.Tomb) (chan *LokiResponse, error) {
 	responseChan := make(chan *LokiResponse)
-	dialer := &websocket.Dialer{} //TODO: TLS support
+	dialer := &websocket.Dialer{} // TODO: TLS support
 	u := lc.getURLFor("loki/api/v1/tail", map[string]string{
 		"limit": strconv.Itoa(lc.config.Limit),
 		"start": strconv.Itoa(int(time.Now().Add(-lc.config.Since).UnixNano())),
@@ -197,10 +198,10 @@ func (lc *LokiClient) Tail(ctx context.Context) (chan *LokiResponse, error) {
 	}
 	requestHeader.Set("User-Agent", "Crowdsec "+cwversion.Version)
 	lc.Logger.Infof("Connecting to %s", u)
-	conn, resp, err := dialer.Dial(u, requestHeader)
-	defer resp.Body.Close()
+	conn, resp, err := dialer.DialContext(ctx, u, requestHeader)
 	if err != nil {
 		if resp != nil {
+			defer resp.Body.Close()
 			buf, err2 := ioutil.ReadAll(resp.Body)
 			if err2 != nil {
 				return nil, fmt.Errorf("error reading response body while handling WS error: %s (%s)", err, err2)
@@ -209,15 +210,16 @@ func (lc *LokiClient) Tail(ctx context.Context) (chan *LokiResponse, error) {
 		}
 		return nil, err
 	}
-
-	lc.t.Go(func() error {
-		return lc.tailLogs(conn, responseChan, ctx)
+	defer resp.Body.Close()
+	t.Go(func() error {
+		defer conn.Close()
+		return lc.tailLogs(ctx, conn, responseChan, t)
 	})
 
 	return responseChan, nil
 }
 
-func (lc *LokiClient) QueryRange(ctx context.Context) chan *LokiQueryRangeResponse {
+func (lc *LokiClient) QueryRange(ctx context.Context, t *tomb.Tomb) chan *LokiQueryRangeResponse {
 	url := lc.getURLFor("loki/api/v1/query_range", map[string]string{
 		"query":     lc.config.Query,
 		"start":     strconv.Itoa(int(time.Now().Add(-lc.config.Since).UnixNano())),
@@ -241,12 +243,12 @@ func (lc *LokiClient) QueryRange(ctx context.Context) chan *LokiQueryRangeRespon
 
 	requestHeader.Set("User-Agent", "Crowdsec "+cwversion.Version)
 	lc.Logger.Infof("Connecting to %s", url)
-	lc.t.Go(func() error {
-		return lc.queryRange(url, ctx, c)
+	t.Go(func() error {
+		return lc.queryRange(ctx, url, c, t)
 	})
 	return c
 }
 
 func NewLokiClient(config Config) *LokiClient {
-	return &LokiClient{t: &tomb.Tomb{}, Logger: log.WithField("component", "lokiclient"), config: config}
+	return &LokiClient{Logger: log.WithField("component", "lokiclient"), config: config}
 }
